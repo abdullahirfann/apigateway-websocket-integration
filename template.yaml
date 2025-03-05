@@ -1,0 +1,177 @@
+AWSTemplateFormatVersion: '2010-09-09'
+
+Parameters:
+  AgentId:
+    Type: String
+    Description: The ID of the Bedrock agent
+  AgentAlias:
+    Type: String
+    Description: The alias of the Bedrock agent
+  AgentMemoryId:
+    Type: String
+    Description: The memory ID of the Bedrock agent
+  AgentArn:
+    Type: String
+    Description: The ARN of the Bedrock agent
+
+Resources:
+  LambdaExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: [lambda.amazonaws.com]
+            Action: ['sts:AssumeRole']
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/AmazonAPIGatewayInvokeFullAccess
+      Policies:
+        - PolicyName: BedrockInvokeAgent
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action: 'bedrock:InvokeAgent'
+                Resource: !Ref AgentArn
+        - PolicyName: LambdaBasicExecution
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - 'logs:CreateLogGroup'
+                  - 'logs:CreateLogStream'
+                  - 'logs:PutLogEvents'
+                Resource: '*'
+
+  WebSocketLambda:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: WebSocketLambda
+      Runtime: python3.9
+      Handler: index.lambda_handler
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Timeout: 900
+      Environment:
+        Variables:
+          AGENT_ID: !Ref AgentId
+          AGENT_ALIAS_ID: !Ref AgentAlias
+          AGENT_MEMORY_ID: !Ref AgentMemoryId
+      Code:
+        ZipFile: |
+          import json
+          import logging
+          import boto3
+          import hashlib
+          import os
+          from botocore.exceptions import EventStreamError
+          from botocore.config import Config
+
+          config = Config(read_timeout=1000)
+
+          def sha256_hash(s: str) -> str:
+              return hashlib.sha256(s.encode()).hexdigest()
+
+          def invoke_agent(email: str, prompt: str):
+              bedrock = boto3.client("bedrock-agent-runtime", config=config)
+              agentId = os.environ.get("AGENT_ID")
+              agentAliasId = os.environ.get("AGENT_ALIAS_ID")
+              memoryId = os.environ.get("AGENT_MEMORY_ID")
+              trace = os.environ.get("TRACE") or "FALSE"
+
+              trace = trace.upper() == "TRUE"
+
+              try:
+                  response = bedrock.invoke_agent(
+                      agentId=agentId,
+                      agentAliasId=agentAliasId,
+                      memoryId=memoryId,
+                      inputText=prompt,
+                      enableTrace=True,
+                      sessionId=sha256_hash(email),
+                      sessionState={"sessionAttributes": {"user_id": email, "gds": "amadeus"}},
+                  )
+                  msg = ""
+                  for event in response.get("completion"):
+                      if trace:
+                          print(event)
+                      if "chunk" in event:
+                          msg += event["chunk"]["bytes"].decode("utf-8")
+                  return {"success": True, "data": msg}
+              except EventStreamError as e:
+                  print(e)
+                  return {"success": False, "data": "Error invoking agent"}
+
+          def lambda_handler(event, context):
+              try:
+                  request_context = event.get("requestContext", {})
+                  command = request_context.get("routeKey")
+                  if command in ["$connect", "$disconnect"]:
+                      return {"statusCode": 200}
+                  elif command == "$default":
+                      connection_id = request_context.get("connectionId")
+                      body = event.get("body")
+                      parsed_body = json.loads(body)
+                      email = parsed_body.get("email")
+                      prompt = parsed_body.get("prompt")
+                      res = invoke_agent(email=email, prompt=prompt)
+                      domain_name = request_context.get("domainName")
+                      stage = request_context.get("stage")
+                      client = boto3.client('apigatewaymanagementapi', endpoint_url=f"https://{domain_name}/{stage}")
+                      client.post_to_connection(ConnectionId=connection_id, Data=json.dumps(res))
+                      return {"statusCode": 200}
+              except Exception as e:
+                  logging.error(e)
+                  return {"statusCode": 500}
+
+  WebSocketAPI:
+    Type: AWS::ApiGatewayV2::Api
+    Properties:
+      Name: WebSocketAPI
+      ProtocolType: WEBSOCKET
+      RouteSelectionExpression: "$request.body.action"
+
+  WebSocketIntegration:
+    Type: AWS::ApiGatewayV2::Integration
+    Properties:
+      ApiId: !Ref WebSocketAPI
+      IntegrationType: AWS_PROXY
+      IntegrationUri: !GetAtt WebSocketLambda.Arn
+
+  WebSocketRoutes:
+    Type: AWS::ApiGatewayV2::Route
+    Properties:
+      ApiId: !Ref WebSocketAPI
+      RouteKey: "$default"
+      AuthorizationType: NONE
+      Target: !Sub integrations/${WebSocketIntegration}
+
+  WebSocketDeployment:
+    Type: AWS::ApiGatewayV2::Deployment
+    Properties:
+      ApiId: !Ref WebSocketAPI
+    DependsOn:
+      - WebSocketRoutes
+
+  WebSocketStage:
+    Type: AWS::ApiGatewayV2::Stage
+    Properties:
+      ApiId: !Ref WebSocketAPI
+      DeploymentId: !Ref WebSocketDeployment
+      StageName: "production"
+      AutoDeploy: true
+
+  WebSocketLambdaPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      Action: lambda:InvokeFunction
+      FunctionName: !Ref WebSocketLambda
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub "arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${WebSocketAPI}/*"
+
+Outputs:
+  WebSocketApiUrl:
+    Description: "WebSocket API Gateway endpoint URL"
+    Value: !Sub "wss://${WebSocketAPI}.execute-api.${AWS::Region}.amazonaws.com/production/"
